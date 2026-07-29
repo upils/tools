@@ -1,0 +1,6 @@
+name: tools-dev
+base: ubuntu@24.04
+sdks:
+  - name: go
+    channel: 1.25
+  - name: vscode-remote
