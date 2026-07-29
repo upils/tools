@@ -58,24 +58,35 @@ func up(o *options) error {
 
 	client := &ws.Client{Exec: ex, Dir: worktreeDir}
 
-	// Step 3: fast path — one read-only query in the steady state (D8).
-	name := o.workshop
-	if info, ierr := client.Info(name); ierr == nil {
-		if info.Status == ws.StatusReady && info.MountIs(o.sdk, o.plug, gitCommonDir) {
-			report(info, worktreeDir, gitCommonDir, o)
+	// Step 4: ensure the plug is declared in workshop.yaml, bootstrapping a
+	// minimal definition when the project has none yet. The name is derived from
+	// the *repository*, not the worktree directory (which is the branch).
+	//
+	// This is done before the fast path because it is a local file read, and
+	// because a live-but-undeclared mount is not a converged state: the next
+	// `workshop refresh` would drop it.
+	defPath := filepath.Join(worktreeDir, "workshop.yaml")
+	if !fileExists(defPath) {
+		projectName := filepath.Base(filepath.Dir(gitCommonDir))
+		if o.dryRun {
+			fmt.Printf("would create %s (workshop %s-dev, base %s, sdk %s)\n",
+				defPath, projectName, wsdef.DefaultBase, wsdef.DefaultSDK)
 			return nil
 		}
-		if name == "" && info.Name != "" {
-			name = info.Name
+		createdDef, berr := wsdef.Bootstrap(defPath, projectName)
+		if berr != nil {
+			return berr
+		}
+		if createdDef {
+			fmt.Printf("created %s (workshop %s-dev, base %s, sdk %s)\n",
+				defPath, projectName, wsdef.DefaultBase, wsdef.DefaultSDK)
 		}
 	}
-
-	// Step 4: ensure the plug is declared in workshop.yaml.
-	defPath := filepath.Join(worktreeDir, "workshop.yaml")
 	def, err := wsdef.Load(defPath)
 	if err != nil {
 		return err
 	}
+	name := o.workshop
 	if name == "" {
 		name = def.Name()
 	}
@@ -98,6 +109,21 @@ func up(o *options) error {
 		}
 	}
 
+	// Step 3: fast path — a single read-only query in the steady state (D8).
+	// Only valid when the definition needed no change, so that the declared and
+	// the live state agree.
+	if !yamlChanged {
+		if info, ierr := client.Info(name); ierr == nil {
+			if info.Status == ws.StatusReady && info.MountIs(o.sdk, o.plug, gitCommonDir) {
+				report(info, worktreeDir, gitCommonDir, o)
+				return nil
+			}
+			if name == "" && info.Name != "" {
+				name = info.Name
+			}
+		}
+	}
+
 	// Step 5: resolve status from `list`, which knows about Off (D7).
 	name, status, err := client.Status(name)
 	if err != nil {
@@ -114,15 +140,11 @@ func up(o *options) error {
 		mountOK = info.MountIs(o.sdk, o.plug, gitCommonDir)
 	}
 
-	steps, err := plan.Plan(plan.State{Status: status, MountOK: mountOK, YAMLChanged: yamlChanged})
-	if err != nil {
-		return err
-	}
-
-	if len(steps) == 0 {
-		fmt.Printf("workshop %s is already ready with %s mounted\n", name, gitCommonDir)
-	}
 	if o.dryRun {
+		steps, perr := plan.Plan(plan.State{Status: status, MountOK: mountOK, YAMLChanged: yamlChanged})
+		if perr != nil {
+			return perr
+		}
 		fmt.Printf("plan for workshop %s (status %s):\n", name, status)
 		if len(steps) == 0 {
 			fmt.Println("  nothing to do")
@@ -133,13 +155,41 @@ func up(o *options) error {
 		return nil
 	}
 
-	if status == ws.StatusReady && !mountOK {
+	// Step 6: apply the definition, if it changed. This says nothing about the
+	// binding — the remount override survives refresh and stop/start (§1.3).
+	prep, _, err := plan.Prepare(status, yamlChanged)
+	if err != nil {
+		return err
+	}
+	for _, s := range prep {
+		if err := execute(client, s, name, o.sdk, o.plug, gitCommonDir); err != nil {
+			return err
+		}
+	}
+
+	// Step 7: re-read the *live* binding before deciding whether to rebind, so
+	// that a correct mount is never torn down (D9; regression: a failed patch
+	// followed by a manual workshop.yaml used to force a needless stop).
+	info, err := client.Info(name)
+	if err != nil {
+		return err
+	}
+	status, mountOK = info.Status, info.MountIs(o.sdk, o.plug, gitCommonDir)
+
+	steps, err := plan.Bracket(status, mountOK)
+	if err != nil {
+		return err
+	}
+	if len(prep) == 0 && len(steps) == 0 {
+		fmt.Printf("workshop %s is already ready with %s mounted\n", name, gitCommonDir)
+	}
+	// Warn only when stopping a workshop the user could actually be connected to
+	// (R4). A workshop this run just launched cannot have a live session.
+	if status == ws.StatusReady && !mountOK && !justLaunched(prep) {
 		fmt.Fprintf(os.Stderr,
 			"wt: warning: workshop %s is running and must be stopped to rebind the mount; "+
 				"any live VS Code session will be interrupted\n", name)
 	}
-
-	// Step 6/7: execute.
 	for _, s := range steps {
 		if err := execute(client, s, name, o.sdk, o.plug, gitCommonDir); err != nil {
 			return err
@@ -147,7 +197,7 @@ func up(o *options) error {
 	}
 
 	// Step 8: verify the post-state rather than trusting the transitions (R1).
-	info, err := client.Info(name)
+	info, err = client.Info(name)
 	if err != nil {
 		return err
 	}
@@ -170,6 +220,23 @@ func up(o *options) error {
 	// Step 9: report.
 	report(info, worktreeDir, gitCommonDir, o)
 	return nil
+}
+
+// justLaunched reports whether this run created the container, in which case no
+// pre-existing session can be interrupted.
+func justLaunched(prep []plan.Step) bool {
+	for _, s := range prep {
+		if s.Kind == plan.Launch {
+			return true
+		}
+	}
+	return false
+}
+
+// fileExists reports whether path exists and is a regular file.
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
 }
 
 func execute(c *ws.Client, s plan.Step, name, sdk, plug, source string) error {

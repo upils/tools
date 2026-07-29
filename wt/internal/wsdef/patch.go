@@ -23,6 +23,50 @@ type File struct {
 // definition. The caller turns this into a clear abort message.
 var ErrSDKNotFound = errors.New("sdk not found in workshop.yaml")
 
+// DefaultBase is the base used for a bootstrapped definition.
+const DefaultBase = "ubuntu@24.04"
+
+// DefaultSDK is the SDK declared in a bootstrapped definition. It matches the
+// default --sdk, so a bootstrapped file is immediately patchable.
+const DefaultSDK = "vscode-remote"
+
+// Template renders a minimal definition for a project, used when the project has
+// no workshop.yaml yet. The workshop is named "<project>-dev".
+func Template(projectName string) []byte {
+	return []byte(fmt.Sprintf(`name: %s-dev
+base: %s
+sdks:
+  - name: %s
+`, projectName, DefaultBase, DefaultSDK))
+}
+
+// Bootstrap writes a minimal definition at path unless it already exists.
+// created reports whether the file was written.
+//
+// The write is exclusive (O_EXCL), so a concurrent creator wins rather than
+// having its file silently overwritten.
+func Bootstrap(path, projectName string) (created bool, err error) {
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("cannot stat %s: %w", path, err)
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil // someone else created it first
+		}
+		return false, fmt.Errorf("cannot create %s: %w", path, err)
+	}
+	defer f.Close()
+
+	if _, err := f.Write(Template(projectName)); err != nil {
+		return false, fmt.Errorf("cannot write %s: %w", path, err)
+	}
+	return true, f.Sync()
+}
+
 // Load reads and parses the definition at path.
 func Load(path string) (*File, error) {
 	raw, err := os.ReadFile(path)

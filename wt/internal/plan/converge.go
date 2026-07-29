@@ -53,68 +53,98 @@ func (e *ErrRefused) Error() string {
 		"before retrying", e.Status)
 }
 
-// Plan returns the steps that converge the workshop to "Ready with the shared
-// .git bound" (design §5.3 steps 5–7).
+// Prepare returns the steps that bring the workshop to a state where the
+// current definition is applied, and the status that results (design §5.3
+// step 6).
+//
+// It deliberately says nothing about the mount binding: the remount override
+// survives `refresh` and stop/start cycles (§1.3), so whether a rebind is needed
+// can only be judged from a *fresh* `workshop info` taken after these steps.
+// That is what Bracket is for.
+func Prepare(status string, yamlChanged bool) (steps []Step, after string, err error) {
+	switch status {
+	case ws.StatusPending, ws.StatusWaiting, ws.StatusError:
+		return nil, "", &ErrRefused{Status: status}
+	case ws.StatusOff:
+		// launch ties the workshop to the project and starts it, binding any
+		// plug to an auto-allocated host directory.
+		return []Step{{Launch, "workshop is Off"}}, ws.StatusReady, nil
+	case ws.StatusReady:
+		if yamlChanged {
+			return []Step{{Refresh, "workshop.yaml changed; apply the definition"}}, ws.StatusReady, nil
+		}
+		return nil, ws.StatusReady, nil
+	case ws.StatusStopped:
+		if yamlChanged {
+			// `refresh` is documented against a Ready workshop, so the
+			// definition change is applied after a start (§5.3 step 6).
+			return []Step{
+				{Start, "apply the definition change from a started workshop"},
+				{Refresh, "workshop.yaml changed; apply the definition"},
+			}, ws.StatusReady, nil
+		}
+		return nil, ws.StatusStopped, nil
+	default:
+		return nil, "", fmt.Errorf("unknown workshop status %q", status)
+	}
+}
+
+// Bracket returns the steps that bind the shared .git directory and leave the
+// workshop Ready (design §5.3 step 7).
+//
+// status must be the *current* status and mountOK the *current* binding, read
+// after Prepare's steps have run. When the binding is already correct no
+// stop/remount/start bracket is emitted — that is what keeps the steady state
+// free and avoids interrupting a live session (D8, R4).
+func Bracket(status string, mountOK bool) ([]Step, error) {
+	switch status {
+	case ws.StatusReady:
+		if mountOK {
+			return nil, nil
+		}
+		return []Step{
+			{Stop, "remounting a populated source requires a stopped workshop"},
+			{Remount, "bind the shared .git directory"},
+			{Start, "resume the workshop"},
+		}, nil
+	case ws.StatusStopped:
+		if mountOK {
+			return []Step{{Start, "workshop is stopped and the mount is already correct"}}, nil
+		}
+		return []Step{
+			{Remount, "bind the shared .git directory"},
+			{Start, "resume the workshop"},
+		}, nil
+	case ws.StatusPending, ws.StatusWaiting, ws.StatusError:
+		return nil, &ErrRefused{Status: status}
+	default:
+		return nil, fmt.Errorf("unexpected workshop status %q after preparation", status)
+	}
+}
+
+// Plan composes Prepare and Bracket into the full predicted sequence.
+//
+// The executor runs the two phases separately, re-reading the binding in
+// between; Plan is the single-snapshot prediction used for `--dry-run` and for
+// exhaustive testing of the state table.
 //
 // It never emits a transition that is invalid for the given status: no `start`
 // on Ready, no `stop` on Stopped, and no `remount` of a populated source outside
 // a Stopped bracket (C2, C4).
 func Plan(s State) ([]Step, error) {
-	switch s.Status {
-	case ws.StatusPending, ws.StatusWaiting, ws.StatusError:
-		return nil, &ErrRefused{Status: s.Status}
-	case ws.StatusOff:
-		// launch creates the container from the (already patched) definition
-		// and leaves it Ready with the plug bound to the auto-allocated
-		// directory; the bracket then points it at the shared .git. (state 1/2/3)
-		return []Step{
-			{Launch, "workshop is Off"},
-			{Stop, "remounting a populated source requires a stopped workshop"},
-			{Remount, "bind the shared .git directory"},
-			{Start, "resume the workshop"},
-		}, nil
-	case ws.StatusReady:
-		var steps []Step
-		if s.YAMLChanged {
-			// state 4: the plug exists in the definition but is not bound yet.
-			steps = append(steps, Step{Refresh, "workshop.yaml changed; bind the new plug"})
-		}
-		if s.MountOK && !s.YAMLChanged {
-			return nil, nil // state 6: steady state, nothing to do
-		}
-		steps = append(
-			steps,
-			Step{Stop, "remounting a populated source requires a stopped workshop"},
-			Step{Remount, "bind the shared .git directory"},
-			Step{Start, "resume the workshop"},
-		)
-		return steps, nil
-	case ws.StatusStopped:
-		var steps []Step
-		if s.YAMLChanged {
-			// `refresh` is documented against a Ready workshop, so the
-			// definition change is applied after a start (§5.3 step 6).
-			steps = append(
-				steps,
-				Step{Start, "apply the definition change from a started workshop"},
-				Step{Refresh, "workshop.yaml changed; bind the new plug"},
-			)
-			steps = append(
-				steps,
-				Step{Stop, "remounting a populated source requires a stopped workshop"},
-				Step{Remount, "bind the shared .git directory"},
-				Step{Start, "resume the workshop"},
-			)
-			return steps, nil
-		}
-		if s.MountOK {
-			return []Step{{Start, "workshop is stopped and the mount is already correct"}}, nil // state 7
-		}
-		return []Step{ // state 8
-			{Remount, "bind the shared .git directory"},
-			{Start, "resume the workshop"},
-		}, nil
-	default:
-		return nil, fmt.Errorf("unknown workshop status %q", s.Status)
+	steps, after, err := Prepare(s.Status, s.YAMLChanged)
+	if err != nil {
+		return nil, err
 	}
+	// After a launch the plug is bound to an auto-allocated directory, never to
+	// the shared .git, so the binding is known-wrong regardless of the input.
+	mountOK := s.MountOK
+	if s.Status == ws.StatusOff {
+		mountOK = false
+	}
+	bracket, err := Bracket(after, mountOK)
+	if err != nil {
+		return nil, err
+	}
+	return append(steps, bracket...), nil
 }

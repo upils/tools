@@ -106,10 +106,12 @@ that occur in practice:
 
 | # | State | Required action |
 |---|---|---|
+| 0 | `workshop.yaml` absent | bootstrap a minimal definition, then as below (D17) |
 | 1 | Worktree absent | create worktree, inject plug, launch, stop, remount, start |
 | 2 | Worktree exists, `workshop.yaml` lacks the plug, workshop `Off` | inject, launch, stop, remount, start |
 | 3 | Worktree exists, plug present, workshop `Off` | launch, stop, remount, start |
 | 4 | Workshop `Ready`, plug just injected (not yet bound) | refresh, stop, remount, start |
+| 4b | Workshop `Ready`, definition changed but mount **already** correct | refresh only (D18) |
 | 5 | Workshop `Ready`, mount bound to the auto-allocated dir | stop, remount, start |
 | 6 | Workshop `Ready`, mount already bound to the shared `.git` | **nothing** — print connection info |
 | 7 | Workshop `Stopped`, mount already correct | start only |
@@ -322,6 +324,8 @@ directory). It must never be committed. Accepted per D3.
 | D14 | `--dry-run` prints the planned command sequence and exits 0; `--verbose` echoes each command and its output | C7/C8; makes the state machine auditable and is the primary debugging aid | small amount of extra plumbing |
 | D15 | Trailing-slash normalisation: strip it. `workshop-target` per the user's note must have **no** trailing slash; the `remount` source is normalised by `filepath.Abs` anyway | consistency; the doc example passes `~/new-cache-mount` with no slash | none |
 | D16 | Take a coarse advisory lock (`flock` on `<worktree>/.wt.lock`, in `.gitignore`-able form) for the duration of a run | prevents two concurrent runs racing the stop/remount/start bracket | a stale lock needs `--force` |
+| D17 | When `workshop.yaml` is absent, bootstrap `name: <project>-dev` / `base: ubuntu@24.04` / `sdks: [vscode-remote]`, named after the **repository** (not the branch); never overwrite an existing file (`O_EXCL`) | many projects have no definition yet, and the minimal one is always the same; the sdk matches the default `--sdk` so the file is immediately patchable | the bootstrapped file is *untracked* rather than modified, so R5's "do not commit" caveat applies more strongly |
+| D18 | Judge "definition needs applying" and "binding needs rebinding" **independently**, and re-read `workshop info` between the two phases: `Prepare(status, yamlChanged)` then `Bracket(status, mountOK)` | the remount override survives `refresh` and stop/start (§1.3), so a changed definition does **not** imply a wrong binding; conflating them stopped a healthy workshop | two `info` reads on the cold path instead of one |
 
 ---
 
@@ -391,13 +395,11 @@ assignment, and the design deliberately keeps a single source of truth for it.
         if branch exists locally:  git -C repo worktree add <worktreeDir> <branch>
         else:                      git -C repo worktree add -b <branch> <worktreeDir> [<--from>]
 
-3.  FAST PATH
-    info := workshop info [<name>] (cwd=worktreeDir, -p worktreeDir)
-    if info parsed and info.status == "ready"
-       and mountSource(info, sdk, plug) == gitCommonDir:
-           print connection info; exit 0            # state 6
-
-4.  ENSURE PLUG IN workshop.yaml
+4.  ENSURE PLUG IN workshop.yaml   (before the fast path: it is a local file read,
+                                   and a live-but-undeclared mount is not converged —
+                                   the next `workshop refresh` would drop it)
+    if <worktreeDir>/workshop.yaml is absent:
+        write the bootstrap template, named after the repository       # state 0, D17
     read <worktreeDir>/workshop.yaml
     locate sdks[] entry with name == --sdk          → else abort (SDK not in definition)
     desired: plugs.<plug>.interface == "mount"
@@ -405,24 +407,34 @@ assignment, and the design deliberately keeps a single source of truth for it.
     if already exactly that:   yamlChanged = false
     else:                      patch via yaml.Node, atomic write, yamlChanged = true
 
+3.  FAST PATH   (only when yamlChanged == false, so that the declared and the
+                 live state agree)
+    info := workshop info [<name>] (cwd=worktreeDir, -p worktreeDir)
+    if info parsed and info.status == "ready"
+       and mountSource(info, sdk, plug) == gitCommonDir:
+           print connection info; exit 0            # state 6
+
 5.  RESOLVE STATUS
     status := from `workshop list --no-headers` (cwd=worktreeDir, -p worktreeDir),
               matched on the workshop name
     if status in {Pending, Waiting, Error}:  exit 3 with diagnosis      # state 9
 
-6.  CONVERGE
+6.  PREPARE — apply the definition only (plan.Prepare)
     switch status:
       Off:      workshop launch <name>                  # leaves it Ready
-      Ready:    if yamlChanged: workshop refresh <name> # bind the new plug (state 4)
+      Ready:    if yamlChanged: workshop refresh <name> # apply the definition
       Stopped:  if yamlChanged: workshop start; workshop refresh; (stays Ready)
                 # refresh is documented against Ready; simplest correct route is
-                # start → refresh, then fall through to the remount bracket
+                # start → refresh
+    # This step says NOTHING about the binding: the remount override survives
+    # refresh and stop/start (§1.3), so a changed definition does not imply a
+    # wrong binding. See D18.
 
-7.  REMOUNT IF NEEDED
-    info := workshop info <name>
+7.  BRACKET — rebind only if the LIVE binding is wrong (plan.Bracket)
+    info := workshop info <name>          # re-read; do not reuse step 5's snapshot
     if mountSource(info, sdk, plug) == gitCommonDir:
         if info.status == "stopped": workshop start <name>
-        goto 8                                            # states 6/7
+        goto 8                                            # states 6/7/4b
     else:
         if info.status != "stopped": workshop stop <name>  # C2
         workshop remount <name>/<sdk>:<plug> <gitCommonDir>

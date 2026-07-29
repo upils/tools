@@ -141,17 +141,42 @@ already done rather than issuing blind transitions:
 | State | Action |
 |---|---|
 | Worktree absent | create, inject plug, launch, stop, remount, start |
+| `workshop.yaml` absent | bootstrap a minimal one, then converge |
 | Plug missing, workshop `Off` | inject, launch, stop, remount, start |
 | `Ready`, plug just injected | refresh, stop, remount, start |
 | `Ready`, mount on the auto-allocated dir | stop, remount, start |
+| `Ready`, definition changed but mount already correct | refresh only |
 | **`Ready`, mount already correct** | **nothing** — print connection info |
 | `Stopped`, mount correct | start only |
 | `Stopped`, mount incorrect | remount, start |
 | `Pending` / `Waiting` / `Error` | refuse, exit 3 with a diagnosis |
 
-The idempotency oracle is the **live** binding reported by `workshop info`, not the
-presence of the plug in `workshop.yaml` — the YAML says nothing about what is actually
-mounted.
+Two facts are judged **independently**, which is what keeps the tool from doing needless
+work:
+
+- whether the *definition* needs applying (`workshop refresh`);
+- whether the *live binding* needs rebinding (the stop/remount/start bracket).
+
+A changed `workshop.yaml` does **not** imply a rebind: the remount override survives
+`refresh` and stop/start cycles. So the binding is re-read from `workshop info` after the
+definition is applied, and the bracket runs only if the binding is genuinely wrong. The
+idempotency oracle is that live binding, not the presence of the plug in `workshop.yaml`.
+
+### Bootstrapping a project with no `workshop.yaml`
+
+If the project has no definition, `wt` writes a minimal one (`<project>-dev`, named after
+the repository — not the branch) before converging:
+
+```yaml
+name: <project>-dev
+base: ubuntu@24.04
+sdks:
+  - name: vscode-remote
+```
+
+An existing definition is never overwritten, only patched. Note that a bootstrapped file
+is **untracked** rather than modified, and still carries the machine-specific mount path,
+so it should not be committed as-is.
 
 ### Things worth knowing
 
@@ -182,15 +207,23 @@ those IDs, so non-obvious code points back to its rationale.
 ```
 cmd/wt/          main.go  flags, exit codes; up.go  the algorithm (§5.3)
 internal/gitwt/  git plumbing: common-dir discovery, layout, worktree creation
-internal/wsdef/  comment-preserving workshop.yaml patch (yaml.Node) + atomic write
+internal/wsdef/  workshop.yaml: bootstrap, comment-preserving patch, atomic write
 internal/ws/     workshop CLI adapter: exec helper, info/list parsers, operations
-internal/plan/   the convergence state machine, as a pure function
+internal/plan/   the convergence state machine, as pure functions
 internal/lock/   advisory lock
 ```
 
-The state machine is deliberately a pure `(status, mountOK, yamlChanged) → []Step`
-function, so every state is unit-testable without a container, and a wrong assumption
-about workshop's runtime behaviour is a one-table fix.
+The state machine is deliberately pure, so every state is unit-testable without a
+container and a wrong assumption about workshop's runtime behaviour is a one-table fix.
+It is split in two phases, mirroring the fact that the definition and the live binding are
+independent:
+
+- `Prepare(status, yamlChanged)` — apply the definition; returns the resulting status.
+- `Bracket(status, mountOK)` — rebind the mount, given a **freshly read** binding.
+
+`Plan` composes both for `--dry-run` and for exhaustive testing. The executor runs them
+separately, re-reading `workshop info` in between — that is what prevents tearing down a
+mount that is already correct.
 
 ```console
 $ go test ./...
