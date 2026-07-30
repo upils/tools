@@ -46,10 +46,13 @@ sdks:
 // The write is exclusive (O_EXCL), so a concurrent creator wins rather than
 // having its file silently overwritten.
 func Bootstrap(path, projectName string) (created bool, err error) {
-	if _, err := os.Stat(path); err == nil {
-		return false, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return false, fmt.Errorf("cannot stat %s: %w", path, err)
+	switch st, serr := os.Stat(path); {
+	case serr == nil && st.Mode().IsRegular():
+		return false, nil // a definition is already there
+	case serr == nil:
+		return false, fmt.Errorf("%s exists but is not a regular file", path)
+	case !errors.Is(serr, os.ErrNotExist):
+		return false, fmt.Errorf("cannot stat %s: %w", path, serr)
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)

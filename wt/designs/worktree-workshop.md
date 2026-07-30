@@ -106,7 +106,8 @@ that occur in practice:
 
 | # | State | Required action |
 |---|---|---|
-| 0 | `workshop.yaml` absent | bootstrap a minimal definition, then as below (D17) |
+| 0 | No definition in any documented location | bootstrap a minimal definition, then as below (D17, D19) |
+| 0b | Several definitions, none named after the project | refuse; `--definition`/`--workshop` disambiguate (D19) |
 | 1 | Worktree absent | create worktree, inject plug, launch, stop, remount, start |
 | 2 | Worktree exists, `workshop.yaml` lacks the plug, workshop `Off` | inject, launch, stop, remount, start |
 | 3 | Worktree exists, plug present, workshop `Off` | launch, stop, remount, start |
@@ -324,7 +325,8 @@ directory). It must never be committed. Accepted per D3.
 | D14 | `--dry-run` prints the planned command sequence and exits 0; `--verbose` echoes each command and its output | C7/C8; makes the state machine auditable and is the primary debugging aid | small amount of extra plumbing |
 | D15 | Trailing-slash normalisation: strip it. `workshop-target` per the user's note must have **no** trailing slash; the `remount` source is normalised by `filepath.Abs` anyway | consistency; the doc example passes `~/new-cache-mount` with no slash | none |
 | D16 | Take a coarse advisory lock (`flock` on `<worktree>/.wt.lock`, in `.gitignore`-able form) for the duration of a run | prevents two concurrent runs racing the stop/remount/start bracket | a stale lock needs `--force` |
-| D17 | When `workshop.yaml` is absent, bootstrap `name: <project>-dev` / `base: ubuntu@24.04` / `sdks: [vscode-remote]`, named after the **repository** (not the branch); never overwrite an existing file (`O_EXCL`) | many projects have no definition yet, and the minimal one is always the same; the sdk matches the default `--sdk` so the file is immediately patchable | the bootstrapped file is *untracked* rather than modified, so R5's "do not commit" caveat applies more strongly |
+| D19 | Resolve the definition across all three documented locations (`workshop.yaml`, `.workshop.yaml`, `.workshop/<NAME>.yaml`) instead of assuming the root file. With several, edit the one named after the project (`<project>-dev`, then `<project>`), or the one given by `--workshop`/`--definition`; otherwise refuse and list the candidates. Bootstrap only when **none** exists | the reference allows all three, and `<NAME>` under `.workshop/` must equal the `name` field, so the filename is authoritative; editing an arbitrary definition, or shadowing an existing layout with a new root file, would silently misconfigure the project | discovery is a directory read on every run; ambiguous multi-workshop projects need one extra flag |
+| D17 | When no definition exists anywhere, bootstrap `name: <project>-dev` / `base: ubuntu@24.04` / `sdks: [vscode-remote]`, named after the **repository** (not the branch); never overwrite an existing file (`O_EXCL`) | many projects have no definition yet, and the minimal one is always the same; the sdk matches the default `--sdk` so the file is immediately patchable | the bootstrapped file is *untracked* rather than modified, so R5's "do not commit" caveat applies more strongly |
 | D18 | Judge "definition needs applying" and "binding needs rebinding" **independently**, and re-read `workshop info` between the two phases: `Prepare(status, yamlChanged)` then `Bracket(status, mountOK)` | the remount override survives `refresh` and stop/start (§1.3), so a changed definition does **not** imply a wrong binding; conflating them stopped a healthy workshop | two `info` reads on the cold path instead of one |
 
 ---
@@ -395,12 +397,17 @@ assignment, and the design deliberately keeps a single source of truth for it.
         if branch exists locally:  git -C repo worktree add <worktreeDir> <branch>
         else:                      git -C repo worktree add -b <branch> <worktreeDir> [<--from>]
 
-4.  ENSURE PLUG IN workshop.yaml   (before the fast path: it is a local file read,
+4.  ENSURE PLUG IN THE DEFINITION  (before the fast path: it is a local file read,
                                    and a live-but-undeclared mount is not converged —
                                    the next `workshop refresh` would drop it)
-    if <worktreeDir>/workshop.yaml is absent:
-        write the bootstrap template, named after the repository       # state 0, D17
-    read <worktreeDir>/workshop.yaml
+    resolve the definition file (D19):
+        --definition <rel>            → must exist
+        exactly one of workshop.yaml / .workshop.yaml / .workshop/*.yaml → use it
+        several                       → the one named <project>-dev / <project>,
+                                        or --workshop; else refuse   # state 0b
+        none                          → write the bootstrap template,
+                                        named after the repository   # state 0, D17
+    read the resolved definition
     locate sdks[] entry with name == --sdk          → else abort (SDK not in definition)
     desired: plugs.<plug>.interface == "mount"
              plugs.<plug>.workshop-target == workshopTarget

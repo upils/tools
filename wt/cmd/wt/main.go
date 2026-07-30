@@ -38,6 +38,10 @@ Flags:
       --worktree <dir>   Explicit worktree path; overrides layout derivation.
       --from <rev>       Start point for a new branch (default: repo HEAD).
       --workshop <name>  Workshop name (default: the single workshop defined).
+      --definition <p>   Worktree-relative path of the workshop definition to edit
+                         (default: the only one found, else <project>-dev under
+                         .workshop/). Looked up at workshop.yaml,
+                         .workshop.yaml and .workshop/<name>.yaml.
       --sdk <name>       SDK owning the plug (default: vscode-remote).
       --plug <name>      Plug name (default: git-dir).
       --code             Launch VS Code on success.
@@ -48,18 +52,19 @@ Flags:
 `
 
 type options struct {
-	repo     string
-	worktree string
-	from     string
-	workshop string
-	sdk      string
-	plug     string
-	code     bool
-	dryRun   bool
-	verbose  bool
-	force    bool
-	timeout  time.Duration
-	branch   string
+	repo       string
+	worktree   string
+	from       string
+	workshop   string
+	definition string
+	sdk        string
+	plug       string
+	code       bool
+	dryRun     bool
+	verbose    bool
+	force      bool
+	timeout    time.Duration
+	branch     string
 }
 
 func main() {
@@ -111,6 +116,8 @@ func parseFlags(argv []string) (*options, error) {
 	fs.StringVar(&o.worktree, "worktree", "", "explicit worktree path")
 	fs.StringVar(&o.from, "from", "", "start point for a new branch")
 	fs.StringVar(&o.workshop, "workshop", "", "workshop name")
+	fs.StringVar(&o.definition, "definition", "",
+		"worktree-relative path of the workshop definition to edit")
 	fs.StringVar(&o.sdk, "sdk", "vscode-remote", "sdk owning the plug")
 	fs.StringVar(&o.plug, "plug", "git-dir", "plug name")
 	fs.BoolVar(&o.code, "code", false, "launch VS Code on success")

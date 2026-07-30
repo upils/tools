@@ -92,6 +92,7 @@ wt up [<branch>] [flags]
 | `--worktree <dir>` | derived | Explicit worktree path; overrides derivation |
 | `--from <rev>` | repo HEAD | Start point for a new branch |
 | `--workshop <name>` | the single workshop defined | Workshop name |
+| `--definition <path>` | discovered | Worktree-relative path of the definition to edit |
 | `--sdk <name>` | `vscode-remote` | SDK owning the mount plug |
 | `--plug <name>` | `git-dir` | Plug name |
 | `--code` | off | Launch VS Code on success |
@@ -141,7 +142,8 @@ already done rather than issuing blind transitions:
 | State | Action |
 |---|---|
 | Worktree absent | create, inject plug, launch, stop, remount, start |
-| `workshop.yaml` absent | bootstrap a minimal one, then converge |
+| No definition in any known location | bootstrap a minimal one, then converge |
+| Several definitions, none identifiable | refuse; use `--definition` or `--workshop` |
 | Plug missing, workshop `Off` | inject, launch, stop, remount, start |
 | `Ready`, plug just injected | refresh, stop, remount, start |
 | `Ready`, mount on the auto-allocated dir | stop, remount, start |
@@ -162,10 +164,40 @@ A changed `workshop.yaml` does **not** imply a rebind: the remount override surv
 definition is applied, and the bracket runs only if the binding is genuinely wrong. The
 idempotency oracle is that live binding, not the presence of the plug in `workshop.yaml`.
 
-### Bootstrapping a project with no `workshop.yaml`
+### Which definition file gets edited
 
-If the project has no definition, `wt` writes a minimal one (`<project>-dev`, named after
-the repository — not the branch) before converging:
+A project may hold its
+[workshop definition](https://ubuntu.com/workshop/docs/reference/definition-files/workshop-definition/)
+in any of three documented places, so `wt` looks for all of them rather than assuming
+`workshop.yaml`:
+
+- `workshop.yaml` in the project root;
+- `.workshop.yaml` in the project root;
+- `.workshop/<name>.yaml`, one per workshop, where `<name>` must equal the `name` field.
+
+Selection rules:
+
+| Found | Behaviour |
+|---|---|
+| Exactly one | edit it, wherever it lives |
+| Several | edit the one named after the project (`<project>-dev`, then `<project>`) |
+| Several, none matching | refuse and list them — never guess |
+| None | bootstrap a minimal `workshop.yaml` |
+
+`--workshop <name>` also disambiguates, and `--definition <path>` names the file outright:
+
+```console
+$ wt up my-feature --definition .workshop/chisel-dev.yaml
+```
+
+`--definition` must point at an existing file: a typo fails rather than quietly creating a
+new definition. Files under `.workshop/` that are not `*.yaml`, and in-project SDK
+directories, are ignored.
+
+### Bootstrapping a project with no definition
+
+Only when **none** of the locations above contains a definition, `wt` writes a minimal one
+(named after the repository, not the branch):
 
 ```yaml
 name: <project>-dev

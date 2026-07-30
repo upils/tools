@@ -58,54 +58,65 @@ func up(o *options) error {
 
 	client := &ws.Client{Exec: ex, Dir: worktreeDir}
 
-	// Step 4: ensure the plug is declared in workshop.yaml, bootstrapping a
-	// minimal definition when the project has none yet. The name is derived from
-	// the *repository*, not the worktree directory (which is the branch).
+	// Step 4: ensure the plug is declared in the workshop definition,
+	// bootstrapping a minimal one only when the project has none at all. The
+	// definition may live at workshop.yaml, .workshop.yaml or .workshop/<NAME>.yaml
+	// (D19), so the file to edit is resolved rather than assumed.
 	//
 	// This is done before the fast path because it is a local file read, and
 	// because a live-but-undeclared mount is not a converged state: the next
 	// `workshop refresh` would drop it.
-	defPath := filepath.Join(worktreeDir, "workshop.yaml")
-	if !fileExists(defPath) {
-		projectName := filepath.Base(filepath.Dir(gitCommonDir))
+	projectName := filepath.Base(filepath.Dir(gitCommonDir))
+	sel, err := wsdef.Select(worktreeDir, projectName, o.definition, o.workshop)
+	if err != nil {
+		return err
+	}
+	if sel.Bootstrap {
 		if o.dryRun {
 			fmt.Printf("would create %s (workshop %s-dev, base %s, sdk %s)\n",
-				defPath, projectName, wsdef.DefaultBase, wsdef.DefaultSDK)
+				sel.Rel, projectName, wsdef.DefaultBase, wsdef.DefaultSDK)
 			return nil
 		}
-		createdDef, berr := wsdef.Bootstrap(defPath, projectName)
+		createdDef, berr := wsdef.Bootstrap(sel.Path, projectName)
 		if berr != nil {
 			return berr
 		}
 		if createdDef {
 			fmt.Printf("created %s (workshop %s-dev, base %s, sdk %s)\n",
-				defPath, projectName, wsdef.DefaultBase, wsdef.DefaultSDK)
+				sel.Rel, projectName, wsdef.DefaultBase, wsdef.DefaultSDK)
 		}
 	}
-	def, err := wsdef.Load(defPath)
+	def, err := wsdef.Load(sel.Path)
 	if err != nil {
 		return err
 	}
+	// A definition under .workshop/ must have `name` equal to its filename, so
+	// the filename is authoritative for the workshop identity.
 	name := o.workshop
 	if name == "" {
 		name = def.Name()
 	}
+	if sel.Name != "" && def.Name() != "" && sel.Name != def.Name() {
+		fmt.Fprintf(os.Stderr,
+			"wt: warning: %s declares name %q but must be named after the file (%q); "+
+				"workshop will reject it\n", sel.Rel, def.Name(), sel.Name)
+	}
 	yamlChanged, err := def.EnsureMountPlug(o.sdk, o.plug, gitCommonDir)
 	if err != nil {
 		if errors.Is(err, wsdef.ErrSDKNotFound) {
-			return fmt.Errorf("%s: %w; add the sdk or pass --sdk", defPath, err)
+			return fmt.Errorf("%s: %w; add the sdk or pass --sdk", sel.Rel, err)
 		}
 		return err
 	}
 	if yamlChanged {
 		if o.dryRun {
 			fmt.Printf("would patch %s: sdk %s gains mount plug %s -> %s\n",
-				defPath, o.sdk, o.plug, gitCommonDir)
+				sel.Rel, o.sdk, o.plug, gitCommonDir)
 		} else {
 			if err := def.Write(); err != nil {
 				return err
 			}
-			fmt.Printf("patched %s (mount plug %q -> %s)\n", defPath, o.plug, gitCommonDir)
+			fmt.Printf("patched %s (mount plug %q -> %s)\n", sel.Rel, o.plug, gitCommonDir)
 		}
 	}
 
@@ -231,12 +242,6 @@ func justLaunched(prep []plan.Step) bool {
 		}
 	}
 	return false
-}
-
-// fileExists reports whether path exists and is a regular file.
-func fileExists(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && st.Mode().IsRegular()
 }
 
 func execute(c *ws.Client, s plan.Step, name, sdk, plug, source string) error {
