@@ -156,6 +156,87 @@ func TestLayoutNoBranch(t *testing.T) {
 	}
 }
 
+// TestResolvePrecedence covers the override rules of §5.1 that used to live
+// inline in cmd/wt and were therefore untestable.
+func TestResolvePrecedence(t *testing.T) {
+	const common = "/home/u/projects/chisel/.git"
+
+	tests := []struct {
+		name         string
+		common       string
+		ov           Override
+		wantWorktree string
+		wantProject  string
+		wantErr      bool
+	}{{
+		name:         "derived from the branch",
+		common:       common,
+		ov:           Override{Branch: "feature"},
+		wantWorktree: "/home/u/projects/chisel-worktrees/feature",
+		wantProject:  "chisel",
+	}, {
+		name:         "explicit worktree wins over derivation",
+		common:       common,
+		ov:           Override{Branch: "feature", WorktreeDir: "/tmp/elsewhere"},
+		wantWorktree: "/tmp/elsewhere",
+		wantProject:  "chisel",
+	}, {
+		name:         "explicit worktree is cleaned",
+		common:       common,
+		ov:           Override{Branch: "feature", WorktreeDir: "/tmp/a/../elsewhere/"},
+		wantWorktree: "/tmp/elsewhere",
+		wantProject:  "chisel",
+	}, {
+		// --worktree is the documented escape hatch for a layout that cannot be
+		// derived from, so it must relax the ".git" check rather than inherit it.
+		name:         "explicit worktree rescues a bare repository",
+		common:       "/home/u/projects/chisel.git",
+		ov:           Override{Branch: "feature", WorktreeDir: "/tmp/elsewhere"},
+		wantWorktree: "/tmp/elsewhere",
+		wantProject:  "chisel",
+	}, {
+		name:    "bare repository without an override is refused",
+		common:  "/home/u/projects/chisel.git",
+		ov:      Override{Branch: "feature"},
+		wantErr: true,
+	}, {
+		name:         "no branch and no override yields no worktree",
+		common:       common,
+		ov:           Override{},
+		wantWorktree: "",
+		wantProject:  "chisel",
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l, err := Resolve(tc.common, tc.ov)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got %+v", l)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if l.WorktreeDir != tc.wantWorktree {
+				t.Errorf("WorktreeDir = %q, want %q", l.WorktreeDir, tc.wantWorktree)
+			}
+			// ProjectName must always be derivable: it names the workshop
+			// definition (D19) even when the worktree came from the user.
+			if l.ProjectName != tc.wantProject {
+				t.Errorf("ProjectName = %q, want %q", l.ProjectName, tc.wantProject)
+			}
+			if l.GitCommonDir != filepath.Clean(tc.common) {
+				t.Errorf("GitCommonDir = %q", l.GitCommonDir)
+			}
+			if l.Branch != tc.ov.Branch {
+				t.Errorf("Branch = %q, want %q", l.Branch, tc.ov.Branch)
+			}
+		})
+	}
+}
+
 func TestEnsureWorktreeIdempotent(t *testing.T) {
 	repo, r := initRepo(t, "chisel")
 	common, err := CommonDir(r, repo)

@@ -1,6 +1,12 @@
+//go:build unix
+
 // Package lock provides the coarse advisory lock that serialises runs against
 // one worktree (design D16). The lock file lives outside the worktree so that it
 // never shows up in `git status` (risk R10).
+//
+// The implementation is flock(2)-based, and `workshop` is a snap, so the tool is
+// Unix-only by construction; the build constraint states that rather than
+// leaving it to a compile error.
 package lock
 
 import (
@@ -18,7 +24,8 @@ type Lock struct {
 	f    *os.File
 }
 
-// Path returns the lock file path, for diagnostics.
+// Path returns the lock file path. It exists so that the location itself can be
+// asserted: TestLockIsOutsideWorktree uses it to guard R10.
 func (l *Lock) Path() string { return l.path }
 
 // Release unlocks and closes the lock file.

@@ -18,7 +18,7 @@ The single feature design is `designs/worktree-workshop.md`, and it is the autho
 
 - Build and test from inside this directory: `go build ./cmd/wt` and `go test ./...`.
 - The entire dependency set is `gopkg.in/yaml.v3`, required for comment-preserving edits to user definitions. Adding a dependency requires a justification in the design.
-- `internal/ws.Exec` is the single gateway for every child process. Do NOT call `os/exec` anywhere else; the pure packages take a narrow interface such as `gitwt.Runner` instead, which is what keeps them testable without real binaries.
+- `internal/ws.Exec` is the single gateway for every `git` and `workshop` invocation (§5.5): it forces the machine-readable child environment, applies `--timeout`, and folds stderr into the error. Do NOT reach for `os/exec` for those; the pure packages take a narrow interface such as `gitwt.Runner` instead, which is what keeps them testable without real binaries. The one deliberate exception is spawning `code` under `--code` in `cmd/wt/up.go`, which is a detached fire-and-forget with no output to capture.
 - Exit codes are `0` success including "already done", `1` unexpected error, `2` usage error, and `3` refused because of the workshop status (`Pending`, `Waiting` or `Error`). They are the documented contract in `README.md`.
 - `--dry-run` must remain free: it prints the plan the state machine produced, so read-only queries still run while mutating commands are only recorded.
 
@@ -41,7 +41,7 @@ Two facts are judged independently, and conflating them is the most common way t
 # Directory
 
 - `cmd/wt/` - CLI entry point: flag parsing, exit codes and the imperative algorithm of design §5.3. Contains `up.go` for the `wt up` command, and the integration tests, which drive a real `git` against a faked `workshop` via the stub in `cmd/wt/testdata/workshop-stub.sh`.
-- `internal/gitwt/` - Git plumbing: derives the path layout of a repository and its worktrees, and creates linked worktrees.
+- `internal/gitwt/` - Git plumbing: derives the path layout of a repository and its worktrees (`Resolve` → `Layout`, the single source of truth for every path a run uses), and creates linked worktrees.
 - `internal/lock/` - Coarse advisory `flock` serialising concurrent runs against one worktree, held outside the worktree.
 - `internal/plan/` - The convergence state machine, as a pure function from observed state to an ordered plan.
 - `internal/ws/` - Adapter for the `workshop` CLI: the single exec helper, tolerant parsers for `info` and `list`, and the operations the state machine needs.

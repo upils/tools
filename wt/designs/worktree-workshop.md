@@ -314,7 +314,7 @@ directory). It must never be committed. Accepted per D3.
 | D3 | Accept the dirty `workshop.yaml`; inject idempotently, skip when already correct; never `git add`/commit | user choice; keeps the file visible and honest | permanent ` M workshop.yaml` in every worktree |
 | D4 | Never rely on `-p` for `launch`; run every `workshop` command with the process CWD set to the worktree, and *also* pass `-p <worktree>` where supported | `launch` is excluded from `requireProject` in `root.go`; CWD is the universally correct scoping | one extra field on the exec helper |
 | D5 | Defaults `--sdk vscode-remote`, `--plug git-dir`, overridable | user choice | none |
-| D6 | Parse `info` with a **narrow, tolerant** YAML model: unmarshal into a struct exposing only `hostname`, `status`, `sdks.<name>.mounts.<plug>.host-source`, with `yaml.Node`/`map[string]any` for unknown regions; force non-TTY plus `NO_COLOR=1`, `LC_ALL=C` in the child env | C6/§2.3; belt-and-braces against future decoration | if upstream changes the layout, parsing degrades — mitigated by M1 |
+| D6 | Parse `info` with a **narrow, tolerant** YAML model: unmarshal into a struct exposing only `hostname`, `status`, `sdks.<name>.mounts.<plug>.host-source`, with `yaml.Node`/`map[string]any` for unknown regions; force non-TTY plus `NO_COLOR=1`, `LC_ALL=C` in the child env | C6/§2.3; belt-and-braces against future decoration | if upstream changes the layout, parsing degrades — mitigated by R1's raw-output rule |
 | D7 | Determine **status** from `workshop list --no-headers` (knows `Off`), determine **mount binding** from `workshop info` | `info` errors out for a non-existent workshop, conflating "absent" with "daemon down"; `list` distinguishes them | two queries in the cold path (one in the steady path, see D8) |
 | D8 | Steady-state fast path: a single `workshop info`; if it reports `status: ready` **and** the correct `host-source`, exit immediately | C8; state 6 is the common case | none |
 | D9 | Idempotency oracle is `host-source == <git-common-dir>` after `~` expansion and `filepath.Clean`; **not** the presence of the plug in `workshop.yaml` | the YAML says nothing about the live binding (C1) | requires the `info` parse to be correct |
@@ -324,10 +324,11 @@ directory). It must never be committed. Accepted per D3.
 | D13 | No teardown subcommand in v1 | user choice | manual `workshop remove` + `git worktree remove` |
 | D14 | `--dry-run` prints the planned command sequence and exits 0; `--verbose` echoes each command and its output | C7/C8; makes the state machine auditable and is the primary debugging aid | small amount of extra plumbing |
 | D15 | Trailing-slash normalisation: strip it. `workshop-target` per the user's note must have **no** trailing slash; the `remount` source is normalised by `filepath.Abs` anyway | consistency; the doc example passes `~/new-cache-mount` with no slash | none |
-| D16 | Take a coarse advisory lock (`flock` on `<worktree>/.wt.lock`, in `.gitignore`-able form) for the duration of a run | prevents two concurrent runs racing the stop/remount/start bracket | a stale lock needs `--force` |
-| D19 | Resolve the definition across all three documented locations (`workshop.yaml`, `.workshop.yaml`, `.workshop/<NAME>.yaml`) instead of assuming the root file. With several, edit the one named after the project (`<project>-dev`, then `<project>`), or the one given by `--workshop`/`--definition`; otherwise refuse and list the candidates. Bootstrap only when **none** exists | the reference allows all three, and `<NAME>` under `.workshop/` must equal the `name` field, so the filename is authoritative; editing an arbitrary definition, or shadowing an existing layout with a new root file, would silently misconfigure the project | discovery is a directory read on every run; ambiguous multi-workshop projects need one extra flag |
+| D16 | Take a coarse advisory lock (`flock`) for the duration of a run, keyed by a hash of `worktreeDir` and held **outside** the worktree, under `$XDG_RUNTIME_DIR/wt/` (else the OS temp dir) | prevents two concurrent runs racing `git worktree add` and the stop/remount/start bracket; keeping it outside the worktree means it can never appear in `git status` (R10), and hashing the path means the lock needs no existing directory, so it can be taken *before* step 2 creates the worktree | a stale lock needs `--force`; the lock does not survive a reboot, which is the desired behaviour |
 | D17 | When no definition exists anywhere, bootstrap `name: <project>-dev` / `base: ubuntu@24.04` / `sdks: [vscode-remote]`, named after the **repository** (not the branch); never overwrite an existing file (`O_EXCL`) | many projects have no definition yet, and the minimal one is always the same; the sdk matches the default `--sdk` so the file is immediately patchable | the bootstrapped file is *untracked* rather than modified, so R5's "do not commit" caveat applies more strongly |
 | D18 | Judge "definition needs applying" and "binding needs rebinding" **independently**, and re-read `workshop info` between the two phases: `Prepare(status, yamlChanged)` then `Bracket(status, mountOK)` | the remount override survives `refresh` and stop/start (§1.3), so a changed definition does **not** imply a wrong binding; conflating them stopped a healthy workshop | two `info` reads on the cold path instead of one |
+| D19 | Resolve the definition across all three documented locations (`workshop.yaml`, `.workshop.yaml`, `.workshop/<NAME>.yaml`) instead of assuming the root file. With several, edit the one named after the project (`<project>-dev`, then `<project>`), or the one given by `--workshop`/`--definition`; otherwise refuse and list the candidates. Bootstrap only when **none** exists | the reference allows all three, and `<NAME>` under `.workshop/` must equal the `name` field, so the filename is authoritative; editing an arbitrary definition, or shadowing an existing layout with a new root file, would silently misconfigure the project | discovery is a directory read on every run; ambiguous multi-workshop projects need one extra flag |
+| D20 | Print R5's "do not commit" reminder only when the run actually wrote a definition, and name the file it wrote | a reminder printed on every steady-state run is untrue (nothing was modified) and trains the user to ignore it; D19 allows three locations, so the file is not necessarily `workshop.yaml` | the reminder is absent from runs that only converge the container, where the file may still be dirty from an earlier run |
 
 ---
 
@@ -349,6 +350,8 @@ Flags:
       --from <rev>       Start point for a new branch. Default: the repo HEAD.
       --workshop <name>  Workshop name. Default: the single workshop in the
                          definition, else required.
+      --definition <p>   Worktree-relative path of the workshop definition to
+                         edit; must exist. Default: resolved per D19.
       --sdk <name>       SDK owning the plug. Default: vscode-remote.
       --plug <name>      Plug name. Default: git-dir.
       --code             Launch VS Code on success.
@@ -373,7 +376,15 @@ worktreeDir   = filepath.Join(filepath.Dir(mainRoot),
 ```
 
 `--worktree` overrides `worktreeDir`. If `gitCommonDir` does not end in `.git`
-(bare repo, `core.worktree` oddity), abort with a clear message rather than guess.
+(bare repo, `core.worktree` oddity), abort with a clear message rather than guess —
+unless `--worktree` was given, since that flag is precisely the escape hatch for such
+a layout; `projectName` is still derived (from `<name>.git`) because it names the
+definition (D19).
+
+The derivation and the override precedence together are one pure function,
+`gitwt.Resolve(common, Override) → Layout`, and `Layout` is what the run carries
+thereafter. Deriving any of these paths a second time elsewhere is a bug: they must have
+exactly one source of truth.
 
 `workshopTarget = gitCommonDir` (C3, D15).
 `remountSource  = gitCommonDir`.
@@ -385,7 +396,11 @@ assignment, and the design deliberately keeps a single source of truth for it.
 
 ```
 0.  parse flags; resolve repo, gitCommonDir, branch, worktreeDir
-1.  acquire lock on worktreeDir (after step 2 creates it)
+1.  acquire lock on worktreeDir
+    # Before step 2, not after: the lock is keyed by a hash of the path and
+    # lives outside the worktree (D16), so it needs no existing directory —
+    # which is what lets it cover `git worktree add` itself. Locking after
+    # creation would leave two concurrent runs racing to create the worktree.
 
 2.  ENSURE WORKTREE
     if worktreeDir exists:
@@ -461,6 +476,8 @@ assignment, and the design deliberately keeps a single source of truth for it.
       hostname:  <hostname>
 
       code --folder-uri vscode-remote://ssh-remote+workshop@<hostname>/project
+    if this run wrote a definition: print the "do not commit" reminder for
+                                    that file (D20, R5)
     if --code: exec that command
 ```
 
@@ -494,7 +511,7 @@ type wsInfo struct {
 
 Unknown keys are ignored by default in `yaml.v3` (no `KnownFields`), which is what makes
 this tolerant to the cosmetic `installed:`/`tracking:` lines. If unmarshalling fails, the
-tool must print the raw captured output alongside the parse error (M1) — never fail
+tool must print the raw captured output alongside the parse error (R1) — never fail
 silently or fall back to guessing.
 
 Path comparison helper:
@@ -542,7 +559,7 @@ style). Write to `workshop.yaml.tmp-*` in the same directory, `fsync`, `rename`.
 | Alternative | Why rejected |
 |---|---|
 | **Shell/bash script** | The logic is a 9-state machine over parsed command output with path normalisation; Go gives testable pure functions for derivation/parsing/patching, and comment-preserving YAML editing is impractical in bash. (Also the user's explicit preference.) |
-| **Import `github.com/canonical/workshop/client`** for typed status/mounts | Tempting — it removes all text parsing (D6/§5.4 disappears). Rejected per the user: couples this tool to an internal-ish API, pulls a large dependency and its `go 1.26.2` floor, and requires matching the daemon's API version. Revisit if parsing proves brittle (M1). |
+| **Import `github.com/canonical/workshop/client`** for typed status/mounts | Tempting — it removes all text parsing (D6/§5.4 disappears). Rejected per the user: couples this tool to an internal-ish API, pulls a large dependency and its `go 1.26.2` floor, and requires matching the daemon's API version. Revisit if parsing proves brittle — it is R1's escape hatch. |
 | **Commit the `git-dir` plug to `workshop.yaml`** | The target is an absolute, machine- and user-specific path; committing it breaks every other clone and leaks the username. |
 | **Symlink the shared `.git` into the worktree** | Git resolves the `gitdir:` pointer as an absolute path; a symlink inside `/project` does not make `/home/<user>/projects/<p>/.git` exist in the container. Does not solve §1.2. |
 | **Rewrite the worktree's `.git` file / `commondir` to container-relative paths** | Would make the worktree unusable from the host, and diverges the host and container views of the same checkout. |
@@ -556,23 +573,30 @@ style). Write to `workshop.yaml.tmp-*` in the same directory, `fsync`, `rename`.
 
 ## 7. Implementation plan
 
+As built:
+
 ```
 tools/wt/
 ├── go.mod                       module github.com/upils/tools/wt
-├── cmd/wt/main.go               flag parsing, wiring, exit codes
+├── cmd/wt/
+│   ├── main.go                  flag parsing, usage, exit codes
+│   └── up.go                    the algorithm of §5.3, and step execution
 └── internal/
     ├── gitwt/                   git plumbing
-    │   ├── discover.go          CommonDir, WorktreeLayout, IsLinkedWorktree
+    │   ├── discover.go          CommonDir, Layout, Resolve (§5.2 + overrides),
+    │   │                        CurrentWorktree, CurrentBranch
     │   └── add.go               EnsureWorktree (branch exists? add / add -b)
-    ├── wsdef/                   workshop.yaml
-    │   ├── load.go              read + yaml.Node
-    │   └── patch.go             EnsureMountPlug (idempotent), atomic Write
+    ├── wsdef/                   the workshop definition
+    │   ├── discover.go          Discover, Select (D19), ErrAmbiguous
+    │   └── patch.go             Template/Bootstrap (D17), Load,
+    │                            EnsureMountPlug (idempotent), atomic Write
     ├── ws/                      workshop CLI adapter
     │   ├── run.go               exec helper (§5.5)
-    │   ├── parse.go             ParseInfo, ParseList, samePath/expandHome
+    │   ├── parse.go             ParseInfo, ParseList, SamePath/ExpandHome
     │   └── ops.go               Launch, Refresh, Start, Stop, Remount, Info, List
-    ├── plan/                    the state machine (§5.3), pure where possible
-    │   └── converge.go          Plan(state) []Step ; Execute(steps)
+    ├── plan/                    the state machine (§5.3), pure
+    │   └── converge.go          Prepare, Bracket, Plan — all pure; the steps are
+    │                            executed by cmd/wt, which is the only impure part
     └── lock/flock.go            advisory lock (D16)
 ```
 
@@ -657,6 +681,15 @@ assert the remount override survived (per §1.3).
 ---
 
 ## 10. Open items for T0
+
+**Status: still open.** T0 was declared a blocking prerequisite and was not done;
+the assumptions below are currently encoded in *two* places that agree with each
+other by construction — `internal/plan` and the test stub
+`cmd/wt/testdata/workshop-stub.sh`. The suite therefore cannot detect that they
+are wrong, so a green test run says nothing about these five points. This is the
+largest outstanding correctness risk in the tool (R2), and it is invisible from
+the outside. Resolve each against the real snap and, where the answer differs,
+correct the `plan` table and the stub together.
 
 1. Exact exit code and stderr for `start` on `Ready`, and for `stop` on `Stopped`.
 2. Whether `refresh` is accepted while `Stopped` (would simplify §5.3 step 6).

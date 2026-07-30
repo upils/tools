@@ -25,12 +25,9 @@ type Exec struct {
 	DryRun bool
 	// Log receives the echo of commands and streamed stderr.
 	Log io.Writer
-	// Env is appended to the child environment.
+	// Env is appended to the child environment, after the forced values, so a
+	// caller can override them.
 	Env []string
-
-	// Planned collects the argv of every command skipped because of DryRun,
-	// plus every command actually run, in order. It is the audit trail of D14.
-	Planned []string
 }
 
 const defaultTimeout = 15 * time.Minute
@@ -72,7 +69,6 @@ func Quote(name string, args ...string) string {
 // captured and folded into the error on failure (C7).
 func (e *Exec) Output(dir, name string, args ...string) (string, error) {
 	argv := Quote(name, args...)
-	e.Planned = append(e.Planned, argv)
 	if e.Verbose {
 		e.logf("+ %s\n", argv)
 	}
@@ -109,7 +105,6 @@ func (e *Exec) Output(dir, name string, args ...string) (string, error) {
 // container operations stay visible (C8). Under DryRun it only records the argv.
 func (e *Exec) Run(dir, name string, args ...string) error {
 	argv := Quote(name, args...)
-	e.Planned = append(e.Planned, argv)
 	if e.DryRun {
 		e.logf("would run: %s\n", argv)
 		return nil

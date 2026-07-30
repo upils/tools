@@ -14,7 +14,9 @@ type Client struct {
 	Exec *Exec
 	// Dir is the worktree, used both as CWD and as the -p value.
 	Dir string
-	// Bin is the workshop executable name. Defaults to "workshop".
+	// Bin is the workshop executable name. Defaults to "workshop"; production
+	// code leaves it empty, and it is a seam letting the argv contract of D4 be
+	// asserted against a stub.
 	Bin string
 }
 

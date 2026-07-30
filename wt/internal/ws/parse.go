@@ -40,7 +40,8 @@ type Info struct {
 	Project  string         `yaml:"project"`
 	SDKs     map[string]SDK `yaml:"sdks"`
 
-	// Raw is the captured output, kept for diagnostics (M1).
+	// Raw is the captured output, kept so that a caller diagnosing an unexpected
+	// state can show what workshop actually said (R1).
 	Raw string `yaml:"-"`
 }
 

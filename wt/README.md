@@ -212,15 +212,17 @@ so it should not be committed as-is.
 
 ### Things worth knowing
 
-- **`workshop.yaml` is left modified, deliberately.** The injected `workshop-target` is
+- **The definition is left modified, deliberately.** The injected `workshop-target` is
   an absolute, machine-specific host path. It must never be committed. `wt` never stages
-  or commits it, and prints a reminder. Comments and key order in the file are preserved.
+  or commits it, and prints a reminder naming the file — but only on a run that actually
+  wrote it, so the reminder stays true. Comments and key order in the file are preserved.
 - **A rebind interrupts a live session.** If the workshop is `Ready` with the wrong
   mount, converging requires a `stop`; `wt` warns before doing so. In the steady state
   this never happens.
 - **Concurrent runs are serialised** by an advisory lock kept under `$XDG_RUNTIME_DIR`
-  (not in the worktree, so it never shows up in `git status`). Use `--force` to override
-  a stale one.
+  (not in the worktree, so it never shows up in `git status`). It is taken before the
+  worktree is created, so it covers `git worktree add` too. Use `--force` to override a
+  stale one.
 - **A crash mid-bracket is recoverable**: the next run sees `Stopped` with a correct
   mount and only starts.
 
@@ -232,7 +234,7 @@ No teardown subcommand — remove a worktree manually with `workshop remove` and
 ## Design and development
 
 `worktree-workshop.md` is the design this implementation follows. It records the problem
-analysis, the constraints (`C1`…`C9`), a decisions table with trade-offs (`D1`…`D16`),
+analysis, the constraints (`C1`…`C9`), a decisions table with trade-offs (`D1`…`D19`),
 rejected alternatives, the test plan and the risks (`R1`…`R10`). Code comments reference
 those IDs, so non-obvious code points back to its rationale.
 

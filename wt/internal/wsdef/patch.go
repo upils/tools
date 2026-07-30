@@ -1,5 +1,11 @@
-// Package wsdef reads and patches a workshop definition file (workshop.yaml)
-// while preserving comments and key order (design D11, §5.6).
+// Package wsdef resolves, bootstraps and patches a project's workshop
+// definition.
+//
+// A definition may live in any of three documented locations, so which file to
+// edit is discovered and, when ambiguous, refused rather than guessed (D19; see
+// discover.go). Only when a project has none anywhere is a minimal one written
+// (D17). An existing file is patched through the yaml.Node API so that
+// comments, key order and formatting survive (D11, §5.6).
 package wsdef
 
 import (
@@ -193,8 +199,8 @@ func (f *File) EnsureMountPlug(sdk, plug, target string) (changed bool, err erro
 	return changed, nil
 }
 
-// Marshal renders the (possibly patched) document.
-func (f *File) Marshal() ([]byte, error) {
+// marshal renders the (possibly patched) document.
+func (f *File) marshal() ([]byte, error) {
 	var sb strings.Builder
 	enc := yaml.NewEncoder(&sb)
 	enc.SetIndent(2)
@@ -210,7 +216,7 @@ func (f *File) Marshal() ([]byte, error) {
 // Write atomically replaces the file on disk with the current document
 // (temp file in the same directory, fsync, rename — §5.6).
 func (f *File) Write() error {
-	data, err := f.Marshal()
+	data, err := f.marshal()
 	if err != nil {
 		return fmt.Errorf("cannot render %s: %w", f.Path, err)
 	}

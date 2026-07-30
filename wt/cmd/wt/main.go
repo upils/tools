@@ -39,9 +39,10 @@ Flags:
       --from <rev>       Start point for a new branch (default: repo HEAD).
       --workshop <name>  Workshop name (default: the single workshop defined).
       --definition <p>   Worktree-relative path of the workshop definition to edit
-                         (default: the only one found, else <project>-dev under
-                         .workshop/). Looked up at workshop.yaml,
-                         .workshop.yaml and .workshop/<name>.yaml.
+                         (default: the only one found among workshop.yaml,
+                         .workshop.yaml and .workshop/<name>.yaml; if several,
+                         the one named <project>-dev or <project>; if none, a
+                         minimal workshop.yaml is created).
       --sdk <name>       SDK owning the plug (default: vscode-remote).
       --plug <name>      Plug name (default: git-dir).
       --code             Launch VS Code on success.

@@ -35,9 +35,11 @@ The fix is a deliberate path-identity trick: the mount's in-container `workshop-
 
 A mount's host source can only be set by `workshop remount`, and remounting a populated source requires a stopped workshop. The bracket is therefore necessary the first time, but the resulting override persists across `refresh` and stop/start, so a correct implementation never repeats it. In the steady state `wt` performs a single read-only query and exits (`D8`).
 
-## Paths come from git, never from the CWD
+## Paths come from git, never from the CWD, and are derived exactly once
 
 The layout is derived from `git rev-parse --path-format=absolute --git-common-dir`, which is authoritative from the main worktree and from any linked one alike. Do NOT infer the repository or worktree layout by manipulating the current directory string. Branch names containing `/` are flattened to a single path segment to avoid nested directories and collisions (`R7`).
+
+The derivation plus the user's overrides are one pure function, `gitwt.Resolve`, returning a `gitwt.Layout` that the run then carries. Re-deriving any member of it — `ProjectName` from `filepath.Base(filepath.Dir(gitCommonDir))`, say — is a bug even when it happens to agree: the two copies drift, and `ProjectName` in particular decides which workshop definition is edited (`D19`).
 
 ## Refusal beats guessing
 
@@ -49,6 +51,14 @@ Statuses `Pending`, `Waiting` and `Error` admit no valid transition, so `wt` ref
 
 `internal/wsdef/patch.go` edits definitions through `yaml.Node` to preserve comments, key order and formatting. Never marshal a parsed definition back out: it silently destroys the user's file.
 
-## The lock lives outside the worktree
+## The lock lives outside the worktree, and is taken before the worktree exists
 
 The advisory `flock` serialising concurrent runs is deliberately placed outside the worktree so it can never appear in `git status` (`D16`, `R10`). `TestLockIsOutsideWorktree` guards this.
+
+Because `lock.PathFor` hashes the worktree *path string* and never touches the filesystem, the lock does not need the directory to exist — which is why it is acquired **before** `git worktree add`, not after. Acquiring it afterwards leaves two concurrent runs racing to create the same worktree, which is the one race the lock exists to prevent. `TestLockCoversWorktreeCreation` guards the ordering.
+
+## The workshop lifecycle assumptions are unvalidated, and the tests cannot tell
+
+The edge behaviour of `start`, `stop`, `refresh` and `remount` — design §10, risk `R2` — was never checked against the real snap. Those assumptions are encoded in `internal/plan` **and** in `cmd/wt/testdata/workshop-stub.sh`, which agree with each other by construction, so the suite passes whether or not they are true of the real `workshop`.
+
+Treat a green test run as evidence about the state machine's internal consistency only, never as evidence about the snap. When correcting an assumption, change the `plan` table and the stub in the same edit, or the tests will keep asserting the old belief.

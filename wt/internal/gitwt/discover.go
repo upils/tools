@@ -58,23 +58,14 @@ func SanitizeBranch(branch string) string {
 	return strings.ReplaceAll(branch, "/", "-")
 }
 
-// DeriveLayout computes the worktree layout for branch from the repository
-// containing repoDir (§5.2).
+// LayoutFromCommonDir derives the layout for branch from an already-resolved
+// common dir (§5.2). It is pure, which is what makes the derivation
+// unit-testable.
 //
-// A trailing "-worktrees" sibling directory of the main worktree is used, and
-// the branch name is flattened to one segment. It refuses repositories whose
-// common dir is not named ".git" (bare repositories, core.worktree oddities)
-// rather than guessing.
-func DeriveLayout(r Runner, repoDir, branch string) (Layout, error) {
-	common, err := CommonDir(r, repoDir)
-	if err != nil {
-		return Layout{}, err
-	}
-	return LayoutFromCommonDir(common, branch)
-}
-
-// LayoutFromCommonDir derives the layout from an already-resolved common dir.
-// It is pure, which is what makes §5.2 unit-testable.
+// A "-worktrees" sibling directory of the main worktree is used, and the branch
+// name is flattened to one segment. It refuses repositories whose common dir is
+// not named ".git" (bare repositories, core.worktree oddities) rather than
+// guessing; `--worktree` is the documented override for those.
 func LayoutFromCommonDir(common, branch string) (Layout, error) {
 	common = filepath.Clean(common)
 	if filepath.Base(common) != ".git" {
@@ -98,6 +89,47 @@ func LayoutFromCommonDir(common, branch string) (Layout, error) {
 	if branch != "" {
 		l.WorktreeDir = filepath.Join(l.WorktreesRoot, SanitizeBranch(branch))
 	}
+	return l, nil
+}
+
+// Override carries the user's explicit choices, which win over derivation
+// (§5.1: --worktree, and the branch positional).
+type Override struct {
+	// WorktreeDir, when set, replaces the derived worktree directory.
+	WorktreeDir string
+	// Branch is the branch the layout is for. It may be empty when the worktree
+	// is given explicitly or was discovered from the CWD.
+	Branch string
+}
+
+// Resolve produces the final layout for a run: the derivation of §5.2 with the
+// user's overrides applied. It is pure, so the precedence rules are testable
+// without a repository.
+//
+// An explicit WorktreeDir also relaxes the ".git" check: a bare repository or a
+// core.worktree oddity cannot be derived from, and --worktree is precisely the
+// documented escape hatch for it. The rest of the layout is still filled in
+// best-effort, because ProjectName is needed to name the workshop definition
+// (D19) even when the worktree path came from the user.
+func Resolve(common string, ov Override) (Layout, error) {
+	if ov.WorktreeDir == "" {
+		return LayoutFromCommonDir(common, ov.Branch)
+	}
+
+	l, err := LayoutFromCommonDir(common, ov.Branch)
+	if err != nil {
+		// The layout is not derivable (a bare repository, say), but the project
+		// name still is: for "<name>.git" it is "<name>". MainRoot and
+		// WorktreesRoot are left empty rather than guessed, because such a
+		// repository has no main working tree to be the parent of.
+		clean := filepath.Clean(common)
+		l = Layout{
+			GitCommonDir: clean,
+			ProjectName:  strings.TrimSuffix(filepath.Base(clean), ".git"),
+			Branch:       ov.Branch,
+		}
+	}
+	l.WorktreeDir = filepath.Clean(ov.WorktreeDir)
 	return l, nil
 }
 

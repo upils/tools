@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"strings"
 
 	"github.com/upils/tools/wt/internal/gitwt"
 	"github.com/upils/tools/wt/internal/lock"
@@ -23,13 +23,25 @@ func up(o *options) error {
 		Log:     os.Stderr,
 	}
 
-	// Step 0: resolve repo, gitCommonDir, branch, worktreeDir.
-	gitCommonDir, worktreeDir, branch, err := resolvePaths(ex, o)
+	// Step 0: resolve the whole path layout in one place (§5.2).
+	layout, err := resolvePaths(ex, o)
 	if err != nil {
 		return err
 	}
+	gitCommonDir, worktreeDir, branch := layout.GitCommonDir, layout.WorktreeDir, layout.Branch
 
-	// Step 2: ensure the worktree exists (before locking it, D16/step 1).
+	// Step 1: serialise runs against this worktree, before anything is created.
+	// The lock is keyed by a hash of the path and lives outside the worktree
+	// (D16, R10), so it needs no existing directory — which is what lets it cover
+	// `git worktree add` itself. Locking after creation would leave two
+	// concurrent runs racing to create the same worktree.
+	lk, err := lock.Acquire(worktreeDir, o.force)
+	if err != nil {
+		return err
+	}
+	defer lk.Release()
+
+	// Step 2: ensure the worktree exists.
 	created := false
 	if !gitwt.DirExists(worktreeDir) && o.dryRun {
 		fmt.Printf("would create worktree %s for branch %s\n", worktreeDir, branch)
@@ -49,13 +61,6 @@ func up(o *options) error {
 			worktreeDir, mismatch, branch)
 	}
 
-	// Step 1: serialise runs against this worktree.
-	lk, err := lock.Acquire(worktreeDir, o.force)
-	if err != nil {
-		return err
-	}
-	defer lk.Release()
-
 	client := &ws.Client{Exec: ex, Dir: worktreeDir}
 
 	// Step 4: ensure the plug is declared in the workshop definition,
@@ -66,7 +71,13 @@ func up(o *options) error {
 	// This is done before the fast path because it is a local file read, and
 	// because a live-but-undeclared mount is not a converged state: the next
 	// `workshop refresh` would drop it.
-	projectName := filepath.Base(filepath.Dir(gitCommonDir))
+	//
+	// wroteDef records the definition this run actually wrote, so that the
+	// "do not commit" reminder of R5 is printed only when there is something to
+	// not commit, and names the file that was really touched (D20; D19 allows
+	// three locations, so it is not necessarily workshop.yaml).
+	var wroteDef string
+	projectName := layout.ProjectName
 	sel, err := wsdef.Select(worktreeDir, projectName, o.definition, o.workshop)
 	if err != nil {
 		return err
@@ -84,6 +95,7 @@ func up(o *options) error {
 		if createdDef {
 			fmt.Printf("created %s (workshop %s-dev, base %s, sdk %s)\n",
 				sel.Rel, projectName, wsdef.DefaultBase, wsdef.DefaultSDK)
+			wroteDef = sel.Rel
 		}
 	}
 	def, err := wsdef.Load(sel.Path)
@@ -117,6 +129,7 @@ func up(o *options) error {
 				return err
 			}
 			fmt.Printf("patched %s (mount plug %q -> %s)\n", sel.Rel, o.plug, gitCommonDir)
+			wroteDef = sel.Rel
 		}
 	}
 
@@ -126,7 +139,7 @@ func up(o *options) error {
 	if !yamlChanged {
 		if info, ierr := client.Info(name); ierr == nil {
 			if info.Status == ws.StatusReady && info.MountIs(o.sdk, o.plug, gitCommonDir) {
-				report(info, worktreeDir, gitCommonDir, o)
+				report(info, worktreeDir, gitCommonDir, wroteDef, o)
 				return nil
 			}
 			if name == "" && info.Name != "" {
@@ -208,29 +221,50 @@ func up(o *options) error {
 	}
 
 	// Step 8: verify the post-state rather than trusting the transitions (R1).
+	//
+	// A failure here means the transitions were accepted but the result is not
+	// what was asked for, which is the signature of a parser that has drifted
+	// from the real output. So each diagnosis quotes what workshop actually said
+	// (info.Raw), rather than leaving the user to re-run `workshop info` and
+	// guess what wt saw (R1).
 	info, err = client.Info(name)
 	if err != nil {
 		return err
 	}
 	if info.Status != ws.StatusReady {
-		return fmt.Errorf("workshop %s is %q after convergence, expected ready", name, info.Status)
+		return withRaw(info, fmt.Errorf(
+			"workshop %s is %q after convergence, expected ready", name, info.Status,
+		))
 	}
 	if !info.MountIs(o.sdk, o.plug, gitCommonDir) {
 		src, _ := info.MountSource(o.sdk, o.plug)
-		return fmt.Errorf("mount %s/%s:%s is bound to %q, expected %s",
-			name, o.sdk, o.plug, src, gitCommonDir)
+		return withRaw(info, fmt.Errorf("mount %s/%s:%s is bound to %q, expected %s",
+			name, o.sdk, o.plug, src, gitCommonDir))
 	}
 	if info.Hostname == "" {
-		return fmt.Errorf("workshop %s reports no hostname; cannot connect", name)
+		return withRaw(info, fmt.Errorf(
+			"workshop %s reports no hostname; cannot connect", name,
+		))
 	}
 	if info.Project != "" && !ws.SamePath(info.Project, worktreeDir) {
-		return fmt.Errorf("workshop %s is bound to project %s, expected %s (R8)",
-			name, info.Project, worktreeDir)
+		return withRaw(info, fmt.Errorf("workshop %s is bound to project %s, expected %s (R8)",
+			name, info.Project, worktreeDir))
 	}
 
 	// Step 9: report.
-	report(info, worktreeDir, gitCommonDir, o)
+	report(info, worktreeDir, gitCommonDir, wroteDef, o)
 	return nil
+}
+
+// withRaw appends the captured `workshop info` output to a verification error,
+// so that a post-state mismatch shows what workshop reported rather than only
+// what wt concluded from it (R1).
+func withRaw(info *ws.Info, err error) error {
+	if info == nil || info.Raw == "" {
+		return err
+	}
+	return fmt.Errorf("%w\n--- workshop info ---\n%s\n--- end ---",
+		err, strings.TrimRight(info.Raw, "\n"))
 }
 
 // justLaunched reports whether this run created the container, in which case no
@@ -262,49 +296,53 @@ func execute(c *ws.Client, s plan.Step, name, sdk, plug, source string) error {
 }
 
 // resolvePaths implements design §5.2 plus the "already inside a worktree" case.
-func resolvePaths(ex *ws.Exec, o *options) (gitCommonDir, worktreeDir, branch string, err error) {
-	gitCommonDir, err = gitwt.CommonDir(ex, o.repo)
+//
+// It returns the whole layout rather than loose strings, so that every path a
+// run needs — including ProjectName, which names the workshop definition (D19) —
+// has exactly one derivation.
+func resolvePaths(ex *ws.Exec, o *options) (gitwt.Layout, error) {
+	common, err := gitwt.CommonDir(ex, o.repo)
 	if err != nil {
-		return "", "", "", err
-	}
-	branch = o.branch
-
-	if o.worktree != "" {
-		return gitCommonDir, o.worktree, branch, nil
+		return gitwt.Layout{}, err
 	}
 
-	if branch == "" {
-		// Use the current worktree when it is a linked one (§5.1).
+	ov := gitwt.Override{WorktreeDir: o.worktree, Branch: o.branch}
+
+	// With neither a branch nor an explicit worktree, the current directory must
+	// itself be a linked worktree; use it and its checked-out branch (§5.1).
+	if ov.Branch == "" && ov.WorktreeDir == "" {
 		root, linked, cerr := gitwt.CurrentWorktree(ex, o.repo)
 		if cerr != nil {
-			return "", "", "", cerr
+			return gitwt.Layout{}, cerr
 		}
 		if !linked {
-			return "", "", "", errors.New(
+			return gitwt.Layout{}, errors.New(
 				"a branch name is required: the current directory is the main worktree, " +
 					"not a linked worktree",
 			)
 		}
-		cur, _ := gitwt.CurrentBranch(ex, root)
-		return gitCommonDir, root, cur, nil
+		ov.WorktreeDir = root
+		ov.Branch, _ = gitwt.CurrentBranch(ex, root)
 	}
 
-	layout, err := gitwt.LayoutFromCommonDir(gitCommonDir, branch)
-	if err != nil {
-		return "", "", "", err
-	}
-	return gitCommonDir, layout.WorktreeDir, branch, nil
+	return gitwt.Resolve(common, ov)
 }
 
-func report(info *ws.Info, worktreeDir, gitCommonDir string, o *options) {
+// report prints the connection details. wroteDef is the worktree-relative path
+// of the definition this run wrote, or "" when none was touched.
+func report(info *ws.Info, worktreeDir, gitCommonDir, wroteDef string, o *options) {
 	uri := fmt.Sprintf("vscode-remote://ssh-remote+workshop@%s/project", info.Hostname)
 	fmt.Printf("\nworkshop:  %s\n", info.Name)
 	fmt.Printf("project:   %s\n", worktreeDir)
 	fmt.Printf("git-dir:   %s  (mounted)\n", gitCommonDir)
 	fmt.Printf("hostname:  %s\n", info.Hostname)
 	fmt.Printf("\ncode --folder-uri %s\n", uri)
-	fmt.Printf("\nnote: workshop.yaml is intentionally left modified in this worktree; " +
-		"the injected path is machine-specific — do not commit it.\n")
+	// Only warn when this run actually wrote the file (D20, R5). Printing it on
+	// every steady-state run would be untrue and train the user to ignore it.
+	if wroteDef != "" {
+		fmt.Printf("\nnote: %s is intentionally left modified in this worktree; "+
+			"the injected path is machine-specific — do not commit it.\n", wroteDef)
+	}
 
 	if !o.code {
 		return
